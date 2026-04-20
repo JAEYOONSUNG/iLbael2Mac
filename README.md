@@ -1,4 +1,5 @@
 # iLabel2Mac
+<img width="5128" height="2830" alt="image" src="https://github.com/user-attachments/assets/d5e5a715-598e-4bdb-a431-95a3d428d587" />
 
 `iLabel2Mac` is a clean-room macOS MVP inspired by the Windows-only `iLabel2` workflow.
 
