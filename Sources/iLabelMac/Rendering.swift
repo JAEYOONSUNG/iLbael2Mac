@@ -100,7 +100,7 @@ enum TextLayoutRenderer {
             options: [.documentType: NSAttributedString.DocumentType.rtf],
             documentAttributes: nil
            ) {
-            base = attributed
+            base = normalizedRichText(attributed, for: element)
         } else {
             let paragraph = NSMutableParagraphStyle()
             paragraph.alignment = element.textAlignment.nsTextAlignment
@@ -147,6 +147,44 @@ enum TextLayoutRenderer {
         }
 
         return base
+    }
+
+    private static func normalizedRichText(
+        _ attributed: NSMutableAttributedString,
+        for element: LabelElement
+    ) -> NSMutableAttributedString {
+        let mutable = NSMutableAttributedString(attributedString: attributed)
+        let fullRange = NSRange(location: 0, length: mutable.length)
+        guard fullRange.length > 0 else { return mutable }
+
+        mutable.beginEditing()
+        mutable.enumerateAttributes(in: fullRange, options: []) { attributes, range, _ in
+            var updated = attributes
+            let fontSize = max(0.1, CGFloat(element.fontSize))
+            if let font = attributes[.font] as? NSFont {
+                updated[.font] = font.withSize(fontSize)
+            } else {
+                updated[.font] = PageRenderer.nsFont(
+                    name: element.fontName,
+                    size: fontSize,
+                    isBold: element.isBold,
+                    isItalic: element.isItalic
+                )
+            }
+
+            let paragraph = (attributes[.paragraphStyle] as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle
+                ?? NSMutableParagraphStyle()
+            paragraph.alignment = element.textAlignment.nsTextAlignment
+            updated[.paragraphStyle] = paragraph
+
+            updated[.foregroundColor] = element.foreground.nsColor
+            if updated[.underlineStyle] == nil {
+                updated[.underlineStyle] = element.isUnderline ? NSUnderlineStyle.single.rawValue : 0
+            }
+            mutable.setAttributes(updated, range: range)
+        }
+        mutable.endEditing()
+        return mutable
     }
 }
 
@@ -416,7 +454,10 @@ enum PageRenderer {
     }
 
     static func writeTemporaryPrintPDF(document: LabelDocument, pageIndex: Int) -> URL? {
-        guard let data = imageBackedPDFData(document: document, pageIndex: pageIndex), !data.isEmpty else {
+        let data = directPDFData(document: document, pageIndex: pageIndex)
+            ?? imageBackedPDFData(document: document, pageIndex: pageIndex)
+            ?? Data()
+        guard !data.isEmpty else {
             return nil
         }
         let safeTitle = document.title.replacingOccurrences(of: "/", with: "-")

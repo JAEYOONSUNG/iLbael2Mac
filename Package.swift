@@ -13,6 +13,11 @@ let package = Package(
         .executableTarget(
             name: "iLabelMac",
             path: "Sources/iLabelMac"
+        ),
+        .testTarget(
+            name: "iLabelMacTests",
+            dependencies: ["iLabelMac"],
+            path: "Tests/iLabelMacTests"
         )
     ]
 )

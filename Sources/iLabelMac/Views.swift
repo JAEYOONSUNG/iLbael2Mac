@@ -1140,27 +1140,25 @@ struct InlineEditableTextField: View {
     let unitScale: CGFloat
     let onCommit: () -> Void
 
-    @State private var draftText = ""
-
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: scaled(element.cornerRadiusMM, by: unitScale), style: .continuous)
                 .fill(element.background.color.opacity(max(element.background.alpha, 0.001)))
 
             AppKitInlineTextField(
-                text: $draftText,
+                text: $text,
                 richTextData: $richTextData,
                 fontName: element.fontName,
                 fontSize: max(4, pointsToDisplay(element.fontSize, unitScale: unitScale)),
+                storageFontSize: CGFloat(element.fontSize),
                 isBold: element.isBold,
                 isItalic: element.isItalic,
                 isUnderline: element.isUnderline,
                 alignment: element.textAlignment,
                 foreground: element.foreground.nsColor,
                 caretColor: element.foreground.nsColor,
-                placeCursorAtStart: draftText.hasPrefix("{{serial}}"),
+                placeCursorAtStart: text.hasPrefix("{{serial}}"),
                 onCommit: {
-                    commitDraft()
                     onCommit()
                 }
             )
@@ -1172,23 +1170,6 @@ struct InlineEditableTextField: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.accentColor, lineWidth: 2)
         )
-        .onAppear {
-            draftText = text
-        }
-        .onChange(of: text) { _, newValue in
-            if newValue != draftText {
-                draftText = newValue
-            }
-        }
-        .onDisappear {
-            commitDraft()
-        }
-    }
-
-    private func commitDraft() {
-        if text != draftText {
-            text = draftText
-        }
     }
 }
 
@@ -1197,6 +1178,7 @@ struct AppKitInlineTextField: NSViewRepresentable {
     @Binding var richTextData: Data?
     let fontName: String
     let fontSize: CGFloat
+    let storageFontSize: CGFloat
     let isBold: Bool
     let isItalic: Bool
     let isUnderline: Bool
@@ -1205,6 +1187,25 @@ struct AppKitInlineTextField: NSViewRepresentable {
     let caretColor: NSColor
     let placeCursorAtStart: Bool
     let onCommit: () -> Void
+
+    struct ColorSignature: Equatable {
+        let red: CGFloat
+        let green: CGFloat
+        let blue: CGFloat
+        let alpha: CGFloat
+    }
+
+    struct EditorStyleSignature: Equatable {
+        let fontName: String
+        let fontSize: CGFloat
+        let storageFontSize: CGFloat
+        let isBold: Bool
+        let isItalic: Bool
+        let isUnderline: Bool
+        let alignment: TextAlignModel
+        let foreground: ColorSignature
+        let caret: ColorSignature
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -1232,7 +1233,7 @@ struct AppKitInlineTextField: NSViewRepresentable {
         textView.textContainer?.heightTracksTextView = false
         textView.delegate = context.coordinator
         context.coordinator.textView = textView
-        applyInitialContent(to: textView)
+        applyInitialContent(to: textView, coordinator: context.coordinator)
 
         scrollView.documentView = textView
         DispatchQueue.main.async {
@@ -1248,26 +1249,54 @@ struct AppKitInlineTextField: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let textView = nsView.documentView as? NSTextView else { return }
         context.coordinator.textView = textView
-        applyInitialContent(to: textView)
+        context.coordinator.parent = self
+        applyInitialContent(to: textView, coordinator: context.coordinator)
         DispatchQueue.main.async {
             self.centerVertically(textView)
         }
     }
 
-    private func applyInitialContent(to textView: NSTextView) {
+    private func applyInitialContent(to textView: NSTextView, coordinator: Coordinator) {
+        let currentStyle = styleSignature()
+        let selection = textView.selectedRange()
+        var replacedContent = false
+
         if let richTextData,
            let attributed = try? NSAttributedString(
             data: richTextData,
             options: [.documentType: NSAttributedString.DocumentType.rtf],
             documentAttributes: nil
            ) {
-            textView.textStorage?.setAttributedString(attributed)
+            let storageAttributed = attributedString(attributed, withFontSize: storageFontSize)
+            let displayAttributed = scaledAttributedString(storageAttributed, from: storageFontSize, to: fontSize)
+            if coordinator.lastAppliedRichTextData != richTextData ||
+                coordinator.lastAppliedStyle != currentStyle ||
+                textView.string != displayAttributed.string {
+                textView.textStorage?.setAttributedString(displayAttributed)
+                replacedContent = true
+            }
             applyEditorConfiguration(to: textView)
-            return
         } else if textView.string != text {
             textView.string = text
+            replacedContent = true
         }
-        applyPlainTextAppearance(to: textView)
+
+        if richTextData == nil {
+            if replacedContent || coordinator.lastAppliedStyle != currentStyle {
+                applyPlainTextAppearance(to: textView)
+            } else {
+                applyEditorConfiguration(to: textView)
+            }
+        }
+
+        if replacedContent {
+            restoreSelection(selection, in: textView)
+        }
+        coordinator.captureState(
+            from: textView,
+            richTextData: richTextData,
+            style: currentStyle
+        )
     }
 
     private func currentTypingAttributes() -> [NSAttributedString.Key: Any] {
@@ -1312,12 +1341,79 @@ struct AppKitInlineTextField: NSViewRepresentable {
         resolvedNSFont(name: fontName, size: fontSize, isBold: isBold, isItalic: isItalic)
     }
 
+    private func styleSignature() -> EditorStyleSignature {
+        EditorStyleSignature(
+            fontName: fontName,
+            fontSize: fontSize,
+            storageFontSize: storageFontSize,
+            isBold: isBold,
+            isItalic: isItalic,
+            isUnderline: isUnderline,
+            alignment: alignment,
+            foreground: colorSignature(foreground),
+            caret: colorSignature(caretColor)
+        )
+    }
+
+    private func colorSignature(_ color: NSColor) -> ColorSignature {
+        let converted = color.usingColorSpace(.deviceRGB) ?? color
+        return ColorSignature(
+            red: converted.redComponent,
+            green: converted.greenComponent,
+            blue: converted.blueComponent,
+            alpha: converted.alphaComponent
+        )
+    }
+
+    private func restoreSelection(_ selection: NSRange, in textView: NSTextView) {
+        let maximumLocation = textView.string.utf16.count
+        let location = min(selection.location, maximumLocation)
+        let length = min(selection.length, max(0, maximumLocation - location))
+        textView.setSelectedRange(NSRange(location: location, length: length))
+    }
+
+    private func storageRTFData(from textView: NSTextView) -> Data? {
+        guard let textStorage = textView.textStorage else { return nil }
+        let storageAttributed = scaledAttributedString(textStorage, from: fontSize, to: storageFontSize)
+        return storageAttributed.rtf(
+            from: NSRange(location: 0, length: storageAttributed.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+    }
+
+    private func scaledAttributedString(_ attributed: NSAttributedString, from sourceSize: CGFloat, to targetSize: CGFloat) -> NSAttributedString {
+        let source = max(sourceSize, 0.1)
+        let target = max(targetSize, 0.1)
+        let scale = target / source
+        let mutable = NSMutableAttributedString(attributedString: attributed)
+        mutable.enumerateAttribute(.font, in: NSRange(location: 0, length: mutable.length), options: []) { value, range, _ in
+            guard let font = value as? NSFont else { return }
+            mutable.addAttribute(.font, value: font.withSize(max(0.1, font.pointSize * scale)), range: range)
+        }
+        return mutable
+    }
+
+    private func attributedString(_ attributed: NSAttributedString, withFontSize targetSize: CGFloat) -> NSAttributedString {
+        let mutable = NSMutableAttributedString(attributedString: attributed)
+        let range = NSRange(location: 0, length: mutable.length)
+        mutable.enumerateAttribute(.font, in: range, options: []) { value, range, _ in
+            guard let font = value as? NSFont else {
+                mutable.addAttribute(.font, value: resolvedFont().withSize(targetSize), range: range)
+                return
+            }
+            mutable.addAttribute(.font, value: font.withSize(max(0.1, targetSize)), range: range)
+        }
+        return mutable
+    }
+
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: AppKitInlineTextField
         weak var textView: NSTextView?
         var presetObserver: NSObjectProtocol?
         var styleObserver: NSObjectProtocol?
         var lastSelectedRange = NSRange(location: 0, length: 0)
+        var lastAppliedRichTextData: Data?
+        var lastAppliedStyle: EditorStyleSignature?
 
         init(parent: AppKitInlineTextField) {
             self.parent = parent
@@ -1338,8 +1434,7 @@ struct AppKitInlineTextField: NSViewRepresentable {
                     textStorage.replaceCharacters(in: range, with: preset)
                     let insertionLocation = range.location + (preset as NSString).length
                     textView.setSelectedRange(NSRange(location: insertionLocation, length: 0))
-                    self.parent.text = textView.string
-                    self.parent.richTextData = textView.rtf(from: NSRange(location: 0, length: textView.string.utf16.count))
+                    self.syncBindings(from: textView)
                     self.parent.centerVertically(textView)
                 }
             }
@@ -1368,15 +1463,13 @@ struct AppKitInlineTextField: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
-            parent.richTextData = textView.rtf(from: NSRange(location: 0, length: textView.string.utf16.count))
+            syncBindings(from: textView)
             parent.centerVertically(textView)
         }
 
         func textDidEndEditing(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
-            parent.richTextData = textView.rtf(from: NSRange(location: 0, length: textView.string.utf16.count))
+            syncBindings(from: textView)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -1411,11 +1504,22 @@ struct AppKitInlineTextField: NSViewRepresentable {
                 textStorage.setAttributes(updatedAttributes, range: range)
             }
             textStorage.endEditing()
-            self.parent.text = textView.string
-            self.parent.richTextData = textView.rtf(from: NSRange(location: 0, length: textView.string.utf16.count))
+            self.syncBindings(from: textView)
             self.parent.centerVertically(textView)
             textView.setSelectedRange(targetRange)
             textView.window?.makeFirstResponder(textView)
+        }
+
+        func syncBindings(from textView: NSTextView) {
+            parent.text = textView.string
+            let rtf = parent.storageRTFData(from: textView)
+            parent.richTextData = rtf
+            captureState(from: textView, richTextData: rtf, style: parent.styleSignature())
+        }
+
+        func captureState(from textView: NSTextView, richTextData: Data?, style: EditorStyleSignature) {
+            lastAppliedRichTextData = richTextData
+            lastAppliedStyle = style
         }
     }
 }
